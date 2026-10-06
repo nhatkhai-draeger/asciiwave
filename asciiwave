@@ -45,6 +45,10 @@ It supports:
 Watch mode (-w) will continously poll a file on disk, and redraw whenever the
 file changes. This can be used interactively alongside a text editor.
 
+Reverse mode (-r) converts ASCII art, as rendered by this tool, back into
+WaveJSON. Only single-row graphics tilesets are supported (tiny2, tiny).
+Pass '-' as the source file to read from stdin.
+
 """
 
 # First the key, then the graphics lines
@@ -264,6 +268,161 @@ def render_json(src, out, graphics, force_hscale=None):
 			out.write(" " * lag)
 			out.write(l[lead:] + "\n")
 
+COMMENT_PREFIXES = ("//", "--", "#", ";", "*")
+
+def strip_comment_prefix(lines):
+	nonblank = [l for l in lines if l.strip() != ""]
+	prefix = next((p for p in COMMENT_PREFIXES if nonblank and all(l.startswith(p) for l in nonblank)), None)
+	if prefix is None:
+		return lines
+	out = []
+	for l in lines:
+		if l.strip() == "":
+			out.append(l)
+			continue
+		rest = l[len(prefix):]
+		if rest.startswith(" "):
+			rest = rest[1:]
+		out.append(rest)
+	return out
+
+def find_colon_column(lines):
+	# The renderer left-justifies every name to the same width, so ": " sits
+	# at the same column on every non-blank line; take the min as a safety net.
+	cols = [l.find(": ") for l in lines if l != "" and ": " in l]
+	return min(cols) if cols else None
+
+def parse_signal_name_and_wave(line, colon_col):
+	if colon_col is not None and line[colon_col:colon_col + 2] == ": ":
+		idx = colon_col
+	else:
+		idx = line.find(": ")
+	if idx == -1:
+		raise ValueError("could not find ': ' name separator in line: {!r}".format(line))
+	return line[:idx].rstrip(), line[idx + 2:]
+
+# Render a single candidate wave command for one time unit, reusing the real
+# handlers, so the decode table can never drift from how rendering actually
+# works.
+# Render a single candidate run (a letter plus any trailing dots) for exactly
+# `width` columns, reusing the real handlers, so the decode table can never
+# drift from how rendering actually works. render_signal calls a handler
+# once per run with width = units * charwidth: the hard-edge glyph (if any)
+# is emitted only once, at the very start of the whole run, not per unit --
+# so a run has to be matched as a whole, not as repeated single-unit chunks.
+def simulate_run(cmd, prev_cmd, width, charwidth, graphics_map):
+	outs = [""]
+	put = create_put(outs, graphics_map)
+	if cmd in "pPnN":
+		cmd_clk(cmd, prev_cmd, width, charwidth, [], put)
+	elif cmd in "xz":
+		cmd_other(cmd, prev_cmd, width, charwidth, [], put)
+	else:
+		cmd_10(cmd, prev_cmd, width, charwidth, [], put)
+	return outs[0]
+
+# Candidates for the first letter of a run. 'h'/'1' and 'l'/'0' always render
+# identically (see cmd_10), so only the canonical '1'/'0' are tried; 'u'/'d'
+# can collide when both are flat right after a clock or bus unit -- genuinely
+# ambiguous in the source ASCII, reported as a warning when it happens.
+UNIT_CANDIDATES = list("10HLudpPnNxz")
+
+def decode_signal(wave_part, charwidth, graphics, data_out, line_no, warnings):
+	forward = dict(zip(graphics[0], graphics[1]))
+	graphics_map = dict(zip(graphics[0], zip(*graphics[1:])))
+	bus_open, bus_close, sep = forward["<"], forward[">"], forward["|"]
+	wave = []
+	prev_cmd = "x"
+	pos, n = 0, len(wave_part)
+	while pos < n:
+		ch = wave_part[pos]
+		if ch == sep:
+			wave.append("|")
+			pos += 1
+			continue
+		if ch == bus_open:
+			close_idx = wave_part.find(bus_close, pos + 1)
+			if close_idx == -1:
+				warnings.append("line {}: unterminated bus span at column {}"
+					.format(line_no, pos))
+				close_idx = n - 1
+			span = close_idx - pos + 1
+			label = wave_part[pos + 1:close_idx].strip()
+			units = max(1, round(span / charwidth))
+			wave.append("=" + "." * (units - 1))
+			if label:
+				data_out.append(label)
+			prev_cmd = "="
+			pos = close_idx + 1
+			continue
+		# Greedily take the longest run whose simulated render matches: a
+		# continuation run and a fresh same-letter run render differently
+		# (the edge glyph is per-run, not per-unit), so shorter prefixes of a
+		# genuine long run can coincidentally also "match" a shorter run --
+		# longest-first avoids stopping short.
+		max_units = (n - pos) // charwidth
+		match, units, width = None, 0, 0
+		for try_units in range(max_units, 0, -1):
+			try_width = try_units * charwidth
+			chunk = wave_part[pos:pos + try_width]
+			candidates = [c for c in UNIT_CANDIDATES
+				if simulate_run(c, prev_cmd, try_width, charwidth, graphics_map) == chunk]
+			if candidates:
+				if len(candidates) > 1:
+					warnings.append("line {}: ambiguous pattern {!r} at column {}, assuming {!r}"
+						.format(line_no, chunk, pos, candidates[0]))
+				match, units, width = candidates[0], try_units, try_width
+				break
+		if match is None:
+			width = min(charwidth, n - pos)
+			warnings.append("line {}: unrecognized pattern {!r} at column {}, assuming 'x'"
+				.format(line_no, wave_part[pos:pos + width], pos))
+			match, units = "x", 1
+		wave.append(match + "." * (units - 1))
+		prev_cmd = match
+		pos += width
+	return "".join(wave)
+def detect_charwidth(entries, graphics, force_hscale=None):
+	if force_hscale is not None:
+		return force_hscale * 2 + 2
+	for charwidth in (6, 4, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 40):
+		probe_warnings = []
+		for _, wave_part, line_no in entries:
+			decode_signal(wave_part, charwidth, graphics, [], line_no, probe_warnings)
+		if not probe_warnings:
+			return charwidth
+	print("asciiwave: warning: could not detect time-unit width from input, "
+		"defaulting to hscale=2 (charwidth=6)", file=sys.stderr)
+	return 6
+def ascii_to_json(src, out, graphics, force_hscale=None):
+	lines = strip_comment_prefix(src.splitlines())
+
+	colon_col = find_colon_column(lines)
+	entries = []
+	for i, line in enumerate(lines):
+		entries.append(None if line == "" else parse_signal_name_and_wave(line, colon_col) + (i + 1,))
+
+	charwidth = detect_charwidth([e for e in entries if e is not None], graphics, force_hscale)
+
+	out.write("{ signal: [\n")
+	for e in entries:
+		if e is None:
+			out.write("  {},\n")
+			continue
+		name, wave_part, line_no = e
+		data = []
+		warnings = []
+		wave = decode_signal(wave_part, charwidth, graphics, data, line_no, warnings)
+		for w in warnings:
+			print("asciiwave: warning: " + w, file=sys.stderr)
+		out.write('  { name: "%s", wave: \'%s\'' % (name, wave))
+		if data:
+			out.write(", data: [%s]" % ", ".join('"%s"' % d for d in data))
+		out.write(" },\n")
+	out.write("]")
+	if charwidth != 6:
+		out.write(",\n  config: { hscale: %g }" % ((charwidth - 2) / 2))
+	out.write("\n}\n")
 def posint(x):
 	_x = int(x)
 	if _x <= 0:
@@ -271,12 +430,20 @@ def posint(x):
 	return _x
 
 if __name__ == "__main__":
+	try:
+		sys.stdout.reconfigure(encoding="utf-8")
+		sys.stdin.reconfigure(encoding="utf-8")
+	except AttributeError:
+		pass
+
 	# Preserve newlines in docstring:
 	parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.epilog = __doc__
-	parser.add_argument("src", help="WaveJSON source file")
+	parser.add_argument("src", help="Input file: WaveJSON source, or ASCII art if -r. Use '-' for stdin.")
 	parser.add_argument("-w", "--watch", action="store_true",
 		help="Watch file, continuously update and redraw")
+	parser.add_argument("-r", "--reverse", action="store_true",
+		help="Reverse mode: convert ASCII art (as rendered by this tool) back into WaveJSON")
 	parser.add_argument("-g", "--graphics", choices=["default", "tiny", "tall", "tiny2"],
 		default="tiny2", help="Use a different graphics tileset")
 	parser.add_argument("--hscale", type=posint,
@@ -290,12 +457,26 @@ if __name__ == "__main__":
 		"tall": graphics_tall,
 	}[args.graphics]
 
-	if args.watch:
+	def read_src(path):
+		if path == "-":
+			return sys.stdin.read()
+		ifile = open(path, encoding="utf-8")
+		src = ifile.read()
+		ifile.close()
+		return src
+
+	if args.reverse and args.watch:
+		parser.error("-r/--reverse and -w/--watch cannot be used together")
+
+	if args.reverse:
+		if len(graphics) != 2:
+			parser.error("--graphics {} is not supported with -r/--reverse "
+				"(only tiny2 and tiny have a single-row tileset)".format(args.graphics))
+		ascii_to_json(read_src(args.src), sys.stdout, graphics, force_hscale=args.hscale)
+	elif args.watch:
 		prev_src = None
 		while True:
-			ifile = open(args.src, encoding="utf-8")
-			src = ifile.read()
-			ifile.close()
+			src = read_src(args.src)
 			if src != prev_src:
 				print("\033[H\033[J") # VT100 clear command
 				try:
@@ -307,5 +488,4 @@ if __name__ == "__main__":
 				prev_src = src
 			time.sleep(0.2)
 	else:
-		ifile = open(args.src, encoding="utf-8")
-		render_json(ifile.read(), sys.stdout, graphics, force_hscale=args.hscale)
+		render_json(read_src(args.src), sys.stdout, graphics, force_hscale=args.hscale)

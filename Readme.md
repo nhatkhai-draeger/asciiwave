@@ -56,6 +56,18 @@ Watching file example/step4.json
 Ctrl-C to exit
 ```
 
+asciiwave also features a reverse mode (`-r`), which converts rendered ASCII art back into WaveJSON. Only single-row graphics tilesets (`tiny`, `tiny2`) can be reversed. Pass `-` as the source file to read from stdin, and a shared comment prefix (`//`, `--`, `#`, `;`, `*`) is stripped automatically, so ASCII pasted straight out of an HDL header comment parses as-is. The round trip (WaveJSON -> ASCII -> WaveJSON -> ASCII) is byte-exact for the subset of `wave` commands used, so there's no need to keep the WaveJSON source around once it's been pasted into a comment -- it can be recovered from the ASCII on demand:
+
+```
+$ ./asciiwave -g tiny2 example/step3.json | ./asciiwave -r -g tiny2 -
+{ signal: [
+  { name: "clk", wave: 'P......' },
+  { name: "bus", wave: 'x.==.=x', data: ["head", "body", "tail"] },
+  { name: "wire", wave: '0.1..0.' },
+]
+}
+```
+
 There are simple command-line options for formatting:
 
 ```
